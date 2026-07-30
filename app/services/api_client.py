@@ -196,10 +196,13 @@ def shift_op_user_message(result: ShiftOpResult, *, action: str = 'открыт�
             f'❌ Ошибка данных — не удалось {action} смену.\n'
             f'{result.detail or "Проверьте объект, тип работ и поле."}'
         )
+    fallback = (
+        'Связь с API есть, но запрос отклонён. '
+        'Повторите позже или откройте смену в веб-приложении.'
+    )
     return (
         f'❌ Не удалось {action} смену.\n'
-        f'{result.detail or "Связь с API есть, но запрос отклонён. "
-          "Повторите позже или откройте смену в веб-приложении."}'
+        f'{result.detail or fallback}'
     )
 
 
