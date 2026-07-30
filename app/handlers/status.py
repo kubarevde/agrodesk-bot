@@ -82,10 +82,14 @@ def status_label(status: object) -> str:
 async def my_status(message: Message, api: ApiClient) -> None:
     tg_id = message.from_user.id
     is_admin = await api.is_admin(tg_id)
+    employee = await api.get_employee(tg_id)
+    code = (employee or {}).get('employee_code') or ''
     active = await api.get_active_shift(tg_id)
     if not active:
+        who = f' ({code})' if code else ''
         await message.answer(
-            'ℹ️ Активной смены нет.',
+            f'ℹ️ Активной смены нет{who}.\n'
+            'Нажмите «🟢 Начал работу», чтобы открыть смену (нужен интернет).',
             reply_markup=menu_for_user(is_admin),
         )
         return
@@ -93,11 +97,15 @@ async def my_status(message: Message, api: ApiClient) -> None:
     location = active.get('location') or active.get('location_name') or '—'
     work_type = active.get('work_type') or active.get('work_type_name') or '—'
     equipment = active.get('equipment') or active.get('equipment_name') or '—'
+    field = active.get('field_name') or ''
     start_time = active.get('start_time') or ''
+    field_line = f'\n🌾 {field}' if field else ''
+    code_line = f' · {code}' if code else ''
 
     await message.answer(
-        f'📍 {location} | 🔧 {work_type} | 🚜 {equipment or "—"}\n'
-        f'🕐 Начало: {format_clock(start_time)}  ⏳ Прошло: {await elapsed_label(start_time, api, tg_id)}',
+        f'📍 {location} | 🔧 {work_type} | 🚜 {equipment or "—"}{field_line}\n'
+        f'🕐 Начало: {format_clock(start_time)}  ⏳ Прошло: '
+        f'{await elapsed_label(start_time, api, tg_id)}{code_line}',
         reply_markup=menu_for_user(is_admin),
     )
 

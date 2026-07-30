@@ -179,19 +179,48 @@ async def check_shift_cycle(results: CheckResult, telegram_id: int | None) -> No
         results.fail('Cannot test shift: empty locations or work_types')
         return
 
-    loc_id = str(locations[0]['id'])
-    wt_id = str(work_types[0]['id'])
-    opened = await api.open_shift(telegram_id, loc_id, wt_id, None, None, None)
-    if not opened:
-        results.fail('POST /api/shifts — open failed')
+    # Prefer non-field work type so open doesn't require field_id
+    from app.utils.references import is_field_work_type
+
+    wt = next((item for item in work_types if not is_field_work_type(item)), None)
+    if wt is None:
+        wt = work_types[0]
+    loc = locations[0]
+    loc_id = str(loc['id'])
+    wt_id = str(wt['id'])
+    field_id = None
+    if is_field_work_type(wt):
+        fields = await api.get_fields(telegram_id)
+        if not fields:
+            results.fail('Cannot test shift: field work type but no fields')
+            return
+        field_id = str(fields[0]['id'])
+
+    opened = await api.open_shift(
+        telegram_id,
+        loc_id,
+        wt_id,
+        None,
+        None,
+        None,
+        field_id=field_id,
+    )
+    if not opened.ok:
+        results.fail(
+            f'POST /api/shifts — open failed kind={opened.kind.value} '
+            f'status={opened.status_code} detail={opened.detail}'
+        )
         return
-    results.ok(f'POST /api/shifts — opened id={opened.get("id")}')
+    results.ok(f'POST /api/shifts — opened id={opened.data.get("id") if opened.data else "?"}')
 
     closed = await api.close_shift(telegram_id, 'Smoke test shift close')
-    if not closed:
-        results.fail('POST /api/shifts/close — close failed')
+    if not closed.ok:
+        results.fail(
+            f'POST /api/shifts/{{id}}/close — close failed kind={closed.kind.value} '
+            f'detail={closed.detail}'
+        )
         return
-    results.ok('POST /api/shifts/close — closed')
+    results.ok('POST /api/shifts/{id}/close — closed')
 
 
 def _parse_telegram_id(raw: str | None) -> int | None:

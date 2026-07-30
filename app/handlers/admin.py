@@ -15,9 +15,10 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.keyboards.main_menu import admin_menu_keyboard, cancel_keyboard
-from app.services.api_client import ApiClient
+from app.services.api_client import ApiClient, shift_op_user_message
 from app.services.dual_writer import DualWriter
 from app.states.workday import AdminAddShift, AdminBroadcast, AdminCloseShift
+from app.utils.references import find_by_name, is_field_work_type
 
 router = Router()
 TZ = ZoneInfo("Asia/Bangkok")
@@ -118,6 +119,12 @@ def equipment_keyboard(equipment: list[dict]) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+def fields_keyboard(fields: list[dict]) -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton(text=str(item.get("name", "")))] for item in fields if item.get("name")]
+    rows.append([KeyboardButton(text="❌ Отмена")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
 def comment_choice_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -141,14 +148,6 @@ def find_employee_by_code(employees: list[dict], code: str) -> dict | None:
     for emp in employees:
         if str(emp.get("employee_code", "")).strip() == needle:
             return emp
-    return None
-
-
-def find_by_name(items: list[dict], name: str) -> dict | None:
-    needle = (name or "").strip()
-    for item in items:
-        if str(item.get("name", "")).strip() == needle:
-            return item
     return None
 
 
@@ -272,6 +271,7 @@ def time_keyboard(target: str) -> InlineKeyboardMarkup:
         AdminAddShift.end_time,
         AdminAddShift.location,
         AdminAddShift.work_type,
+        AdminAddShift.field,
         AdminAddShift.equipment,
         AdminAddShift.description,
         AdminAddShift.comment,
@@ -540,6 +540,9 @@ async def admin_add_shift_location(message: Message, state: FSMContext, api: Api
         await message.answer("❌ Список типов работ пуст.", reply_markup=admin_menu_keyboard())
         return
 
+    for wt in work_types:
+        wt['is_field_work'] = is_field_work_type(wt)
+
     await state.update_data(
         location_id=str(item["id"]),
         location_name=str(item.get("name", "")),
@@ -572,10 +575,65 @@ async def admin_add_shift_work_type(message: Message, state: FSMContext, api: Ap
         )
         return
 
-    equipment_items = await api.get_equipment(tg_id)
+    is_field = is_field_work_type(item)
     await state.update_data(
         work_type_id=str(item["id"]),
         work_type_name=str(item.get("name", "")),
+        is_field_work=is_field,
+        field_id=None,
+        field_name=None,
+    )
+
+    if is_field:
+        fields = await api.get_fields(tg_id)
+        if not fields:
+            await state.clear()
+            await message.answer(
+                "Для полевой работы нужны поля в справочнике.",
+                reply_markup=admin_menu_keyboard(),
+            )
+            return
+        await state.update_data(_fields=fields)
+        await state.set_state(AdminAddShift.field)
+        await message.answer("🌾 Выбери поле:", reply_markup=fields_keyboard(fields))
+        return
+
+    equipment_items = await api.get_equipment(tg_id)
+    await state.update_data(_equipment=equipment_items)
+    await state.set_state(AdminAddShift.equipment)
+    await message.answer(
+        "🚜 Выбери технику или нажми «Нет / пропустить»:",
+        reply_markup=equipment_keyboard(equipment_items),
+    )
+
+
+@router.message(AdminAddShift.field)
+async def admin_add_shift_field(message: Message, state: FSMContext, api: ApiClient) -> None:
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=admin_menu_keyboard())
+        return
+
+    tg_id = message.from_user.id
+    if not await api.is_admin(tg_id):
+        await state.clear()
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+
+    data = await state.get_data()
+    fields: list[dict] = data.get("_fields") or []
+    item = find_by_name(fields, message.text or "")
+    if not item:
+        await message.answer(
+            "Выбери поле кнопкой из списка.",
+            reply_markup=fields_keyboard(fields),
+        )
+        return
+
+    equipment_items = await api.get_equipment(tg_id)
+    await state.update_data(
+        field_id=str(item["id"]),
+        field_name=str(item.get("name", "")),
         _equipment=equipment_items,
     )
     await state.set_state(AdminAddShift.equipment)
@@ -866,25 +924,31 @@ async def admin_add_shift_comment(
         start_time=start_iso,
         end_time=end_iso,
         description=full_desc,
+        field_id=data.get("field_id"),
     )
 
     await state.clear()
 
-    if result:
+    if result.ok:
+        field_line = ""
+        field_name = data.get("field_name")
+        if field_name:
+            field_line = f"\n🌾 {field_name}"
         await message.answer(
             f"✅ Смена добавлена\n\n"
             f"👤 {employee_display_name(employee)}\n"
             f"📍 {data.get('location_name', '—')}\n"
-            f"🔧 {data.get('work_type_name', '—')}\n"
+            f"🔧 {data.get('work_type_name', '—')}{field_line}\n"
             f"🚜 {data.get('equipment_name') or '—'}\n"
             f"🕐 {human_dt(start_iso)} → {human_dt(end_iso)}",
             reply_markup=admin_menu_keyboard(),
         )
-    else:
-        await message.answer(
-            "❌ Не удалось добавить смену. Проверьте данные и попробуйте снова.",
-            reply_markup=admin_menu_keyboard(),
-        )
+        return
+
+    await message.answer(
+        shift_op_user_message(result, action='добавить'),
+        reply_markup=admin_menu_keyboard(),
+    )
 
 
 @router.message(F.text == "✅ Закрыть смену за сотрудника")
@@ -1103,7 +1167,7 @@ async def admin_close_shift_comment(
     )
     await state.clear()
 
-    if result:
+    if result.ok:
         end_display = human_dt(data.get("end_time_iso") or data.get("end_time") or "")
         await message.answer(
             f"✅ Смена закрыта\n\n"
@@ -1111,8 +1175,9 @@ async def admin_close_shift_comment(
             f"🕐 Конец: {end_display}",
             reply_markup=admin_menu_keyboard(),
         )
-    else:
-        await message.answer(
-            "❌ Не удалось закрыть смену. Попробуйте снова.",
-            reply_markup=admin_menu_keyboard(),
-        )
+        return
+
+    await message.answer(
+        shift_op_user_message(result, action='закрыть'),
+        reply_markup=admin_menu_keyboard(),
+    )

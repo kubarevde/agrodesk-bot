@@ -25,6 +25,16 @@ class AccessError(str, Enum):
     UNKNOWN = 'unknown'
 
 
+class ShiftOpKind(str, Enum):
+    OK = 'ok'
+    UNREACHABLE = 'unreachable'
+    FORBIDDEN = 'forbidden'
+    CONFLICT = 'conflict'
+    VALIDATION = 'validation'
+    SERVER = 'server'
+    UNKNOWN = 'unknown'
+
+
 @dataclass(frozen=True)
 class AccessResult:
     employee: dict[str, Any] | None
@@ -34,6 +44,20 @@ class AccessResult:
     @property
     def ok(self) -> bool:
         return self.employee is not None and self.error is None
+
+
+@dataclass(frozen=True)
+class ShiftOpResult:
+    """Result of open/close shift against AgroDesk API."""
+
+    kind: ShiftOpKind
+    data: dict[str, Any] | None = None
+    status_code: int | None = None
+    detail: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.kind == ShiftOpKind.OK and self.data is not None
 
 
 USER_MESSAGES: dict[AccessError, str] = {
@@ -64,6 +88,119 @@ USER_MESSAGES: dict[AccessError, str] = {
 def access_message(error: AccessError, tg_id: int) -> str:
     template = USER_MESSAGES.get(error, USER_MESSAGES[AccessError.UNKNOWN])
     return template.format(tg_id=tg_id)
+
+
+def parse_api_detail(response: httpx.Response | None) -> str | None:
+    if response is None:
+        return None
+    try:
+        payload = response.json()
+    except Exception:
+        text = (response.text or '').strip()
+        return text[:300] or None
+    if isinstance(payload, dict):
+        detail = payload.get('detail')
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+        if isinstance(detail, list):
+            parts: list[str] = []
+            for item in detail:
+                if isinstance(item, dict):
+                    msg = item.get('msg') or item.get('message')
+                    loc = item.get('loc')
+                    if msg and loc:
+                        parts.append(f"{'.'.join(str(x) for x in loc)}: {msg}")
+                    elif msg:
+                        parts.append(str(msg))
+                else:
+                    parts.append(str(item))
+            if parts:
+                return '; '.join(parts)[:300]
+    text = (response.text or '').strip()
+    return text[:300] or None
+
+
+def classify_shift_response(response: httpx.Response | None) -> ShiftOpResult:
+    if response is None:
+        return ShiftOpResult(kind=ShiftOpKind.UNREACHABLE, detail='Нет ответа от API')
+    detail = parse_api_detail(response)
+    code = response.status_code
+    if code in (200, 201):
+        try:
+            data = response.json()
+        except Exception:
+            return ShiftOpResult(
+                kind=ShiftOpKind.UNKNOWN,
+                status_code=code,
+                detail='Некорректный ответ API',
+            )
+        if not isinstance(data, dict):
+            return ShiftOpResult(
+                kind=ShiftOpKind.UNKNOWN,
+                status_code=code,
+                detail='Некорректный ответ API',
+            )
+        return ShiftOpResult(kind=ShiftOpKind.OK, data=data, status_code=code)
+    if code in (401, 403):
+        return ShiftOpResult(
+            kind=ShiftOpKind.FORBIDDEN,
+            status_code=code,
+            detail=detail or 'Недостаточно прав',
+        )
+    if code == 409:
+        return ShiftOpResult(
+            kind=ShiftOpKind.CONFLICT,
+            status_code=code,
+            detail=detail or 'Конфликт данных',
+        )
+    if code in (400, 422):
+        return ShiftOpResult(
+            kind=ShiftOpKind.VALIDATION,
+            status_code=code,
+            detail=detail or 'Ошибка данных запроса',
+        )
+    if code >= 500:
+        return ShiftOpResult(
+            kind=ShiftOpKind.SERVER,
+            status_code=code,
+            detail=detail or f'HTTP {code}',
+        )
+    return ShiftOpResult(
+        kind=ShiftOpKind.UNKNOWN,
+        status_code=code,
+        detail=detail or f'HTTP {code}',
+    )
+
+
+def shift_op_user_message(result: ShiftOpResult, *, action: str = 'открыть') -> str:
+    """User-facing text: network/5xx vs business/validation errors."""
+    if result.kind == ShiftOpKind.UNREACHABLE:
+        return (
+            f'❌ Нет связи с API АгроДеск — не удалось {action} смену.\n'
+            'Проверьте интернет или сообщите администратору (API_BASE_URL).'
+        )
+    if result.kind == ShiftOpKind.SERVER:
+        return (
+            f'❌ Сервер АгроДеск временно недоступен — не удалось {action} смену.\n'
+            'Повторите позже.'
+        )
+    if result.kind == ShiftOpKind.FORBIDDEN:
+        return (
+            f'❌ Нет прав, чтобы {action} смену.\n'
+            f'{result.detail or "Обратитесь к администратору."}'
+        )
+    if result.kind == ShiftOpKind.CONFLICT:
+        return f'❌ {result.detail or "Уже есть открытая смена."}'
+    if result.kind == ShiftOpKind.VALIDATION:
+        return (
+            f'❌ Ошибка данных — не удалось {action} смену.\n'
+            f'{result.detail or "Проверьте объект, тип работ и поле."}'
+        )
+    return (
+        f'❌ Не удалось {action} смену.\n'
+        f'{result.detail or "Связь с API есть, но запрос отклонён. "
+          "Повторите позже или откройте смену в веб-приложении."}'
+    )
 
 
 class ApiClient:
@@ -272,6 +409,12 @@ class ApiClient:
     async def get_equipment(self, tg_id: int) -> list[dict]:
         return await self._get_list(tg_id, '/api/equipment', params={'is_active': True})
 
+    async def get_fields(self, tg_id: int) -> list[dict]:
+        return await self._get_list(tg_id, '/api/fields')
+
+    async def get_agro_plans_today(self, tg_id: int) -> list[dict]:
+        return await self._get_list(tg_id, '/api/agro-plan/today')
+
     async def open_shift(
         self,
         tg_id: int,
@@ -280,42 +423,68 @@ class ApiClient:
         equipment_id: str | None,
         lat: float | None,
         lng: float | None,
-    ) -> dict | None:
+        field_id: str | None = None,
+        agro_plan_id: str | None = None,
+        implement_id: str | None = None,
+    ) -> ShiftOpResult:
         body: dict[str, Any] = {
             'location_id': location_id,
             'work_type_id': work_type_id,
-            'equipment_id': equipment_id,
             'latitude': lat,
             'longitude': lng,
         }
+        if equipment_id:
+            body['equipment_id'] = equipment_id
+        if field_id:
+            body['field_id'] = field_id
+        if agro_plan_id:
+            body['agro_plan_id'] = agro_plan_id
+        if implement_id:
+            body['implement_id'] = implement_id
         response = await self._request(tg_id, 'POST', '/api/shifts', json=body)
-        if response is None or response.status_code not in (200, 201):
-            if response is not None:
-                logger.warning(
-                    'open_shift status=%s body=%s',
-                    response.status_code,
-                    response.text[:300],
-                )
-            return None
-        try:
-            return response.json()
-        except Exception:
-            logger.exception('open_shift parse failed')
-            return None
+        result = classify_shift_response(response)
+        if not result.ok:
+            logger.warning(
+                'open_shift tg_id=%s kind=%s status=%s detail=%s',
+                tg_id,
+                result.kind.value,
+                result.status_code,
+                result.detail,
+            )
+        return result
 
-    async def close_shift(self, tg_id: int, description: str) -> dict | None:
+    async def close_shift(self, tg_id: int, description: str) -> ShiftOpResult:
         active = await self.get_active_shift(tg_id)
         if not active:
-            return None
+            return ShiftOpResult(
+                kind=ShiftOpKind.CONFLICT,
+                detail='Нет открытой смены для закрытия',
+            )
         shift_id = active.get('id')
         if not shift_id:
-            return None
+            return ShiftOpResult(
+                kind=ShiftOpKind.UNKNOWN,
+                detail='Открытая смена без id',
+            )
         return await self.close_shift_for_employee(tg_id, str(shift_id), description)
 
     async def get_active_shift(self, tg_id: int) -> dict | None:
-        shifts = await self._get_list(tg_id, '/api/shifts', params={'status': 'open'})
+        """Own open shift only (managers/admins must not pick a colleague's row)."""
+        employee = await self.get_employee(tg_id)
+        if not employee:
+            return None
+        emp_id = employee.get('id')
+        params: dict[str, Any] = {'status': 'open'}
+        if emp_id:
+            params['employee_id'] = str(emp_id)
+        shifts = await self._get_list(tg_id, '/api/shifts', params=params)
         if not shifts:
             return None
+        # Prefer exact match if API returned mixed rows
+        if emp_id:
+            for shift in shifts:
+                if str(shift.get('employee_id') or '') == str(emp_id):
+                    return shift
         return shifts[0]
 
     async def get_all_employees(self, tg_id: int) -> list[dict]:
@@ -338,12 +507,16 @@ class ApiClient:
         start_time: str,
         end_time: str,
         description: str,
-    ) -> dict | None:
+        field_id: str | None = None,
+    ) -> ShiftOpResult:
         shift_date, start_t = self._split_datetime(start_time)
         _, end_t = self._split_datetime(end_time)
         if shift_date is None or start_t is None or end_t is None:
             logger.warning('open_shift_for_employee: invalid datetime %s / %s', start_time, end_time)
-            return None
+            return ShiftOpResult(
+                kind=ShiftOpKind.VALIDATION,
+                detail='Некорректная дата/время смены',
+            )
 
         body: dict[str, Any] = {
             'employee_id': employee_id,
@@ -352,49 +525,44 @@ class ApiClient:
             'end_time': end_t,
             'location_id': location_id,
             'work_type_id': work_type_id,
-            'equipment_id': equipment_id,
             'description': description or None,
         }
+        if equipment_id:
+            body['equipment_id'] = equipment_id
+        if field_id:
+            body['field_id'] = field_id
         response = await self._request(admin_tg_id, 'POST', '/api/shifts/manual', json=body)
-        if response is None or response.status_code not in (200, 201):
-            if response is not None:
-                logger.warning(
-                    'open_shift_for_employee status=%s body=%s',
-                    response.status_code,
-                    response.text[:300],
-                )
-            return None
-        try:
-            return response.json()
-        except Exception:
-            logger.exception('open_shift_for_employee parse failed')
-            return None
+        result = classify_shift_response(response)
+        if not result.ok:
+            logger.warning(
+                'open_shift_for_employee kind=%s status=%s detail=%s',
+                result.kind.value,
+                result.status_code,
+                result.detail,
+            )
+        return result
 
     async def close_shift_for_employee(
         self,
         admin_tg_id: int,
         shift_id: str,
         description: str,
-    ) -> dict | None:
+    ) -> ShiftOpResult:
         response = await self._request(
             admin_tg_id,
             'POST',
             f'/api/shifts/{shift_id}/close',
             json={'description': description},
         )
-        if response is None or response.status_code != 200:
-            if response is not None:
-                logger.warning(
-                    'close_shift status=%s body=%s',
-                    response.status_code,
-                    response.text[:300],
-                )
-            return None
-        try:
-            return response.json()
-        except Exception:
-            logger.exception('close_shift parse failed')
-            return None
+        result = classify_shift_response(response)
+        if not result.ok:
+            logger.warning(
+                'close_shift kind=%s status=%s detail=%s',
+                result.kind.value,
+                result.status_code,
+                result.detail,
+            )
+        return result
 
     async def get_active_shifts_all(self, admin_tg_id: int) -> list[dict]:
         return await self._get_list(admin_tg_id, '/api/shifts', params={'status': 'open'})

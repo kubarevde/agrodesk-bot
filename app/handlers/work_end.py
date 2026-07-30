@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 from app.keyboards.main_menu import cancel_keyboard
-from app.services.api_client import ApiClient
+from app.services.api_client import ApiClient, shift_op_user_message
 from app.services.dual_writer import DualWriter
 from app.states.workday import EndWork
 from app.utils.menu import menu_for_user
@@ -113,9 +113,9 @@ async def work_end_comment(
 
     await state.clear()
 
-    if result:
-        hours = result.get('duration_rounded', 0)
-        amount = result.get('calculated_amount')
+    if result.ok and result.data:
+        hours = result.data.get('duration_rounded', 0)
+        amount = result.data.get('calculated_amount')
         amount_text = (
             f'\n💰 Начислено: {int(float(amount))} руб (предварительно)'
             if amount is not None
@@ -127,8 +127,9 @@ async def work_end_comment(
             f'📝 Сделано: {full_desc}{amount_text}',
             reply_markup=menu_for_user(is_admin),
         )
-    else:
-        await message.answer(
-            '❌ Не удалось закрыть смену.',
-            reply_markup=menu_for_user(is_admin),
-        )
+        return
+
+    await message.answer(
+        shift_op_user_message(result, action='закрыть'),
+        reply_markup=menu_for_user(is_admin),
+    )

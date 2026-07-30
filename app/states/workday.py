@@ -5,6 +5,7 @@ class StartWork(StatesGroup):
     location = State()
     geo = State()
     work_type = State()
+    field = State()
     equipment = State()
     comment = State()
 
@@ -22,6 +23,7 @@ class AdminAddShift(StatesGroup):
     end_time = State()
     location = State()
     work_type = State()
+    field = State()
     equipment = State()
     description = State()
     comment = State()
