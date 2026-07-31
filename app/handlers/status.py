@@ -66,32 +66,92 @@ async def elapsed_label(start_raw: object, api: ApiClient, tg_id: int) -> str:
     return f'{minutes // 60} ч. {minutes % 60} мин.'
 
 
-def duration_from_shift(shift: dict) -> tuple[int, int]:
-    rounded = shift.get('duration_rounded')
-    if rounded is not None:
-        total_minutes = int(float(rounded) * 60)
-        return total_minutes // 60, total_minutes % 60
+def shift_minutes(shift: dict, *, now: datetime, day: date) -> int:
+    """Minutes for report: live elapsed for open, stored/computed for closed."""
+    status = str(shift.get('status') or '').lower()
+    start_raw = shift.get('start_time')
+    end_raw = shift.get('end_time')
+
+    if status == 'open':
+        start_dt = parse_time(start_raw, today=day)
+        raw = str(start_raw or '')
+        if 'T' in raw or (' ' in raw and len(raw) > 10):
+            try:
+                start_dt = datetime.fromisoformat(raw.replace(' ', 'T').split('+')[0])
+            except ValueError:
+                pass
+        if start_dt is None:
+            return 0
+        return max(int((now - start_dt).total_seconds() // 60), 0)
 
     raw = shift.get('duration_raw')
-    if raw is not None:
-        total_minutes = int(raw)
-        return total_minutes // 60, total_minutes % 60
+    if raw not in (None, ''):
+        try:
+            return max(int(float(raw)), 0)
+        except (TypeError, ValueError):
+            pass
 
-    start_dt = parse_time(shift.get('start_time'))
-    end_dt = parse_time(shift.get('end_time'))
+    rounded = shift.get('duration_rounded')
+    if rounded not in (None, ''):
+        try:
+            return max(int(float(rounded) * 60), 0)
+        except (TypeError, ValueError):
+            pass
+
+    start_dt = parse_time(start_raw, today=day)
+    end_dt = parse_time(end_raw, today=day)
     if start_dt is None or end_dt is None:
-        return 0, 0
-    minutes = max(int((end_dt - start_dt).total_seconds() // 60), 0)
-    return minutes // 60, minutes % 60
+        return 0
+    return max(int((end_dt - start_dt).total_seconds() // 60), 0)
 
 
-def status_label(status: object) -> str:
-    value = str(status or '').lower()
-    if value == 'open':
-        return 'открыта'
-    if value == 'closed':
-        return 'закрыта'
-    return str(status or '—')
+def format_hm(total_minutes: int) -> str:
+    hours = total_minutes // 60
+    mins = total_minutes % 60
+    return f'{hours} ч. {mins} мин.'
+
+
+def format_shift_card(shift: dict, *, now: datetime, day: date) -> str:
+    location = shift.get('location') or shift.get('location_name') or '—'
+    work_type = shift.get('work_type') or shift.get('work_type_name') or '—'
+    equipment = shift.get('equipment') or shift.get('equipment_name') or '—'
+    field = shift.get('field_name') or ''
+    start = format_clock(shift.get('start_time'))
+    status = str(shift.get('status') or '').lower()
+    minutes = shift_minutes(shift, now=now, day=day)
+
+    if status == 'open':
+        status_text = '🟢 На смене'
+        end_text = 'сейчас'
+    else:
+        status_text = '✅ Закрыта'
+        end_raw = shift.get('end_time')
+        end_text = format_clock(end_raw) if end_raw else '—'
+
+    geo_text = 'есть' if shift.get('latitude') not in (None, '') and shift.get('longitude') not in (None, '') else 'нет'
+    description = str(shift.get('description') or '').strip()
+    comment = str(shift.get('comment') or '').strip()
+
+    lines = [
+        f'📍 Объект: {location}',
+        f'🔧 Тип: {work_type}',
+        f'🚜 Техника: {equipment or "—"}',
+    ]
+    if field:
+        lines.append(f'🌾 Поле: {field}')
+    lines.extend(
+        [
+            f'🕐 {start} → {end_text}',
+            f'⏱ {format_hm(minutes)}',
+            status_text,
+            f'📌 Геометка: {geo_text}',
+        ]
+    )
+    if description:
+        lines.append(f'📝 Описание: {description}')
+    if comment:
+        lines.append(f'💬 Комментарий: {comment}')
+    return '\n'.join(lines)
 
 
 def shifts_quick_date_keyboard():
@@ -175,43 +235,56 @@ def format_shifts_report(
     *,
     target: date,
     is_admin: bool,
+    now: datetime,
 ) -> str:
-    title = f'📅 Смены за {target.strftime("%d.%m.%Y")}'
+    if is_admin:
+        title = f'📅 Все смены за {target.strftime("%d.%m.%Y")}'
+    else:
+        title = f'📅 Ваши смены за {target.strftime("%d.%m.%Y")}'
+
     if not shifts:
         return f'{title}\n\nСмен не найдено.'
 
-    lines: list[str] = [title]
     total_minutes = 0
+    blocks: list[str] = []
 
-    for shift in shifts:
-        hours, minutes = duration_from_shift(shift)
-        total_minutes += hours * 60 + minutes
+    if is_admin:
+        employee_blocks: dict[str, list[str]] = {}
+        employee_totals: dict[str, int] = {}
+        # Preserve first-seen order of employees
+        employee_order: list[str] = []
 
-        location = shift.get('location') or shift.get('location_name') or '—'
-        work_type = shift.get('work_type') or shift.get('work_type_name') or '—'
-        equipment = shift.get('equipment') or shift.get('equipment_name') or '—'
-        field = shift.get('field_name') or ''
-        start = format_clock(shift.get('start_time'))
-        end_raw = shift.get('end_time')
-        end = format_clock(end_raw) if end_raw else '…'
-        status = status_label(shift.get('status'))
-        field_line = f'\n🌾 {field}' if field else ''
+        for shift in shifts:
+            name = str(
+                shift.get('employee_name') or shift.get('full_name') or '—'
+            ).strip() or '—'
+            minutes = shift_minutes(shift, now=now, day=target)
+            total_minutes += minutes
+            if name not in employee_blocks:
+                employee_blocks[name] = []
+                employee_order.append(name)
+                employee_totals[name] = 0
+            employee_totals[name] += minutes
+            employee_blocks[name].append(format_shift_card(shift, now=now, day=target))
 
-        prefix = ''
-        if is_admin:
-            name = shift.get('employee_name') or shift.get('full_name') or '—'
-            prefix = f'👤 {name}\n'
+        for name in employee_order:
+            blocks.append(
+                f'👤 {name}\n\n'
+                + '\n\n'.join(employee_blocks[name])
+                + f'\n\nИтого по сотруднику: {format_hm(employee_totals[name])}'
+            )
+    else:
+        for shift in shifts:
+            minutes = shift_minutes(shift, now=now, day=target)
+            total_minutes += minutes
+            blocks.append(format_shift_card(shift, now=now, day=target))
 
-        lines.append(
-            f'{prefix}'
-            f'📍 {location} | 🔧 {work_type} | 🚜 {equipment}{field_line}\n'
-            f'🕐 {start} → {end} | ⏱ {hours}ч {minutes}м | {status}'
-        )
-
-    total_h = total_minutes // 60
-    total_m = total_minutes % 60
-    lines.append(f'Итого: {total_h} ч. {total_m} мин.')
-    return '\n\n'.join(lines)
+    return (
+        title
+        + '\n\n'
+        + '\n\n'.join(blocks)
+        + f'\n\nИтого общий: {format_hm(total_minutes)}'
+    )
 
 
 async def send_shifts_for_date(
@@ -221,9 +294,11 @@ async def send_shifts_for_date(
     target: date,
 ) -> None:
     is_admin = await api.is_admin(tg_id)
+    now = await now_in_org(api, tg_id)
     shifts = await api.get_shifts_for_date(tg_id, target.isoformat())
-    text = format_shifts_report(shifts, target=target, is_admin=is_admin)
-    # Telegram message limit — split if needed
+    text = format_shifts_report(
+        shifts, target=target, is_admin=is_admin, now=now
+    )
     if len(text) <= 4000:
         await message.answer(text, reply_markup=menu_for_user(is_admin))
         return
