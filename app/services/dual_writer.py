@@ -41,6 +41,7 @@ class DualWriter:
         start_time_str: str,
         field_id: str | None = None,
         agro_plan_id: str | None = None,
+        start_comment: str | None = None,
     ) -> ShiftOpResult:
         result = await self.api.open_shift(
             tg_id,
@@ -69,7 +70,7 @@ class DualWriter:
                     location_name,
                     equipment_name or '',
                     '',
-                    '',
+                    start_comment or '',
                     'open',
                     '',
                     '',

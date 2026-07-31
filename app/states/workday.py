@@ -2,12 +2,17 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class StartWork(StatesGroup):
+    agro_plan = State()
     location = State()
     geo = State()
     work_type = State()
     field = State()
     equipment = State()
     comment = State()
+
+
+class ShiftsByDate(StatesGroup):
+    pick = State()
 
 
 class EndWork(StatesGroup):

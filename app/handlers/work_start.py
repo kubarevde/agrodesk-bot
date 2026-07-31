@@ -17,6 +17,8 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 SKIP_EQUIPMENT = 'Нет / пропустить'
+SKIP_AGRO_PLAN = 'Своя работа (без плана)'
+_EMPTY_COMMENT_VALUES = frozenset({'нет', 'no', '-'})
 
 
 def format_dt(dt: datetime) -> str:
@@ -60,6 +62,73 @@ def fields_keyboard(fields: list[dict]) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+def comment_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text='Нет')],
+            [KeyboardButton(text='❌ Отмена')],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def _plan_get(plan: dict, *keys: str) -> Any:
+    for key in keys:
+        if plan.get(key) is not None:
+            return plan.get(key)
+    return None
+
+
+def first_field_name(plan: dict) -> str:
+    name = _plan_get(plan, 'field_name', 'fieldName')
+    if name:
+        return str(name).strip()
+    names = _plan_get(plan, 'field_names', 'fieldNames') or []
+    if names:
+        return str(names[0]).strip()
+    return ''
+
+
+def agro_plan_button_label(plan: dict) -> str:
+    work_type = str(
+        _plan_get(plan, 'work_type_name', 'workTypeName') or ''
+    ).strip()
+    field = first_field_name(plan)
+    if work_type and field:
+        label = f'{work_type} · {field}'
+    else:
+        label = work_type or field or 'План'
+    return label[:60]
+
+
+def selectable_agro_plans(plans: list[dict]) -> list[dict]:
+    selected: list[dict] = []
+    for plan in plans:
+        status = str(plan.get('status') or '').strip().lower()
+        if status in ('', 'planned', 'in_progress'):
+            selected.append(plan)
+    return selected
+
+
+def agro_plans_keyboard(plans: list[dict]) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=agro_plan_button_label(plan))]
+        for plan in plans
+    ]
+    rows.append([KeyboardButton(text=SKIP_AGRO_PLAN)])
+    rows.append([KeyboardButton(text='❌ Отмена')])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def find_plan_by_label(plans: list[dict], text: str) -> dict | None:
+    needle = (text or '').strip()
+    for plan in plans:
+        if agro_plan_button_label(plan) == needle:
+            return plan
+    return None
+
+
 def normalize_work_types(work_types: list[dict]) -> list[dict]:
     """Ensure each work type has a reliable boolean is_field_work for FSM/UI."""
     normalized: list[dict] = []
@@ -70,10 +139,35 @@ def normalize_work_types(work_types: list[dict]) -> list[dict]:
     return normalized
 
 
+def plan_work_type_proxy(plan: dict) -> dict[str, Any]:
+    return {
+        'name': str(_plan_get(plan, 'work_type_name', 'workTypeName') or ''),
+        'is_field_work': _plan_get(plan, 'is_field_work', 'isFieldWork'),
+        'isFieldWork': _plan_get(plan, 'isFieldWork', 'is_field_work'),
+        'category': _plan_get(plan, 'category'),
+    }
+
+
 async def cancel_flow(message: Message, state: FSMContext, api: ApiClient) -> None:
     await state.clear()
     is_admin = await api.is_admin(message.from_user.id)
     await message.answer('Отменено.', reply_markup=menu_for_user(is_admin))
+
+
+async def ask_location(message: Message, state: FSMContext, locations: list[dict]) -> None:
+    await state.set_state(StartWork.location)
+    await message.answer(
+        '📍 Где работаешь? Выбери объект:',
+        reply_markup=locations_keyboard(locations),
+    )
+
+
+async def prompt_comment(message: Message, state: FSMContext) -> None:
+    await state.set_state(StartWork.comment)
+    await message.answer(
+        '💬 Комментарий к началу смены (или «Нет»):',
+        reply_markup=comment_keyboard(),
+    )
 
 
 @router.message(F.text == '🟢 Начал работу')
@@ -119,12 +213,87 @@ async def work_start_begin(
         _locations=locations,
         employee=employee,
         start_time_str=start_time_str,
+        agro_plan_id=None,
+        _from_plan=False,
     )
-    await state.set_state(StartWork.location)
-    await message.answer(
-        '📍 Где работаешь? Выбери объект:',
-        reply_markup=locations_keyboard(locations),
+
+    plans = selectable_agro_plans(await api.get_agro_plans_today(tg_id))
+    if plans:
+        await state.update_data(_agro_plans=plans)
+        await state.set_state(StartWork.agro_plan)
+        await message.answer(
+            '📋 Есть задачи на сегодня. Выбери план или свою работу:',
+            reply_markup=agro_plans_keyboard(plans),
+        )
+        return
+
+    await ask_location(message, state, locations)
+
+
+@router.message(StartWork.agro_plan)
+async def work_start_agro_plan(
+    message: Message,
+    state: FSMContext,
+    api: ApiClient,
+) -> None:
+    if message.text == '❌ Отмена':
+        await cancel_flow(message, state, api)
+        return
+
+    data = await state.get_data()
+    locations: list[dict] = data.get('_locations') or []
+    plans: list[dict] = data.get('_agro_plans') or []
+    text = (message.text or '').strip()
+
+    if text == SKIP_AGRO_PLAN:
+        await state.update_data(
+            agro_plan_id=None,
+            work_type_id=None,
+            work_type_name=None,
+            is_field_work=False,
+            field_id=None,
+            field_name=None,
+            equipment_id=None,
+            equipment_name=None,
+            implement_id=None,
+            _from_plan=False,
+        )
+        await ask_location(message, state, locations)
+        return
+
+    plan = find_plan_by_label(plans, text)
+    if not plan:
+        await message.answer(
+            'Выбери план кнопкой из списка.',
+            reply_markup=agro_plans_keyboard(plans),
+        )
+        return
+
+    work_type_id = _plan_get(plan, 'work_type_id', 'workTypeId')
+    work_type_name = str(_plan_get(plan, 'work_type_name', 'workTypeName') or '')
+    field_id = _plan_get(plan, 'field_id', 'fieldId')
+    field_ids = _plan_get(plan, 'field_ids', 'fieldIds') or []
+    if field_id is None and field_ids:
+        field_id = field_ids[0]
+    field_name = first_field_name(plan) or None
+    equipment_id = _plan_get(plan, 'equipment_id', 'equipmentId')
+    equipment_name = _plan_get(plan, 'equipment_name', 'equipmentName')
+    implement_id = _plan_get(plan, 'implement_id', 'implementId')
+    is_field = is_field_work_type(plan_work_type_proxy(plan))
+
+    await state.update_data(
+        agro_plan_id=str(plan.get('id')) if plan.get('id') is not None else None,
+        work_type_id=str(work_type_id) if work_type_id is not None else None,
+        work_type_name=work_type_name,
+        is_field_work=is_field,
+        field_id=str(field_id) if field_id is not None else None,
+        field_name=field_name,
+        equipment_id=str(equipment_id) if equipment_id is not None else None,
+        equipment_name=str(equipment_name) if equipment_name else None,
+        implement_id=str(implement_id) if implement_id is not None else None,
+        _from_plan=True,
     )
+    await ask_location(message, state, locations)
 
 
 @router.message(StartWork.location)
@@ -158,13 +327,28 @@ async def work_start_location(
     )
 
 
-@router.message(StartWork.geo, F.location)
-async def work_start_geo_location(
+async def continue_after_geo(
     message: Message,
     state: FSMContext,
     api: ApiClient,
+    *,
+    lat: float | None,
+    lng: float | None,
 ) -> None:
     tg_id = message.from_user.id
+    data = await state.get_data()
+    await state.update_data(lat=lat, lng=lng)
+
+    if data.get('_from_plan') and data.get('work_type_id'):
+        if data.get('is_field_work') and not data.get('field_id'):
+            await prompt_field_or_fail(message, state, api, tg_id)
+            return
+        if data.get('equipment_id'):
+            await prompt_comment(message, state)
+            return
+        await prompt_equipment(message, state, api, tg_id)
+        return
+
     is_admin = await api.is_admin(tg_id)
     work_types = await api.get_work_types(tg_id)
     if not work_types:
@@ -176,15 +360,26 @@ async def work_start_geo_location(
         return
 
     work_types = normalize_work_types(work_types)
-    await state.update_data(
-        lat=float(message.location.latitude),
-        lng=float(message.location.longitude),
-        _work_types=work_types,
-    )
+    await state.update_data(_work_types=work_types)
     await state.set_state(StartWork.work_type)
     await message.answer(
         '🔧 Выбери тип работы:',
         reply_markup=work_types_keyboard(work_types),
+    )
+
+
+@router.message(StartWork.geo, F.location)
+async def work_start_geo_location(
+    message: Message,
+    state: FSMContext,
+    api: ApiClient,
+) -> None:
+    await continue_after_geo(
+        message,
+        state,
+        api,
+        lat=float(message.location.latitude),
+        lng=float(message.location.longitude),
     )
 
 
@@ -194,24 +389,7 @@ async def work_start_geo_skip(
     state: FSMContext,
     api: ApiClient,
 ) -> None:
-    tg_id = message.from_user.id
-    is_admin = await api.is_admin(tg_id)
-    work_types = await api.get_work_types(tg_id)
-    if not work_types:
-        await state.clear()
-        await message.answer(
-            '❌ Список типов работ пуст.',
-            reply_markup=menu_for_user(is_admin),
-        )
-        return
-
-    work_types = normalize_work_types(work_types)
-    await state.update_data(lat=None, lng=None, _work_types=work_types)
-    await state.set_state(StartWork.work_type)
-    await message.answer(
-        '🔧 Выбери тип работы:',
-        reply_markup=work_types_keyboard(work_types),
-    )
+    await continue_after_geo(message, state, api, lat=None, lng=None)
 
 
 @router.message(StartWork.geo, F.text == '❌ Отмена')
@@ -268,6 +446,7 @@ async def work_start_type(
         field_id=None,
         field_name=None,
         agro_plan_id=None,
+        _from_plan=False,
     )
 
     if is_field:
@@ -352,6 +531,10 @@ async def work_start_field(
         await finish_open_shift(message, state, api, dual)
         return
 
+    if data.get('_from_plan') and data.get('equipment_id'):
+        await prompt_comment(message, state)
+        return
+
     await prompt_equipment(message, state, api, tg_id)
 
 
@@ -384,18 +567,7 @@ async def work_start_equipment(
             equipment_name=str(item.get('name', '')),
         )
 
-    await state.set_state(StartWork.comment)
-    await message.answer(
-        '💬 Комментарий к началу смены (или «Нет»):',
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text='Нет')],
-                [KeyboardButton(text='❌ Отмена')],
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        ),
-    )
+    await prompt_comment(message, state)
 
 
 async def finish_open_shift(
@@ -419,6 +591,7 @@ async def finish_open_shift(
     lng = data.get('lng')
     field_id = data.get('field_id')
     needs_field = bool(data.get('is_field_work'))
+    start_comment = str(data.get('start_comment') or '').strip()
 
     if needs_field and not field_id:
         logger.warning(
@@ -444,6 +617,7 @@ async def finish_open_shift(
         start_time_str=str(data.get('start_time_str') or ''),
         field_id=field_id,
         agro_plan_id=data.get('agro_plan_id'),
+        start_comment=start_comment or None,
     )
 
     if (
@@ -472,12 +646,14 @@ async def finish_open_shift(
         field_name = data.get('field_name')
         if field_name:
             field_line = f'\n🌾 {field_name}'
+        plan_line = '\n📋 По плану' if data.get('agro_plan_id') else ''
+        comment_line = f'\n💬 {start_comment}' if start_comment else ''
         await message.answer(
             f'✅ Начало работы зафиксировано!\n'
             f'📍 {location_name}\n'
-            f'🔧 {work_type_name}{field_line}\n'
+            f'🔧 {work_type_name}{field_line}{plan_line}\n'
             f'🚜 {equipment_name or "—"}\n'
-            f'📌 Геометка: {geo_info}',
+            f'📌 Геометка: {geo_info}{comment_line}',
             reply_markup=menu_for_user(is_admin),
         )
         return
@@ -499,4 +675,7 @@ async def work_start_comment(
         await cancel_flow(message, state, api)
         return
 
+    text = (message.text or '').strip()
+    start_comment = '' if text.lower() in _EMPTY_COMMENT_VALUES else text
+    await state.update_data(start_comment=start_comment)
     await finish_open_shift(message, state, api, dual)

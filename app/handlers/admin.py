@@ -296,6 +296,8 @@ async def who_is_working(message: Message, api: ApiClient) -> None:
         await message.answer("⛔ Команда доступна только администратору.")
         return
 
+    from app.utils.geo import build_geo_lines
+
     shifts = await api.get_active_shifts_all(tg_id)
     if not shifts:
         await message.answer(
@@ -309,14 +311,18 @@ async def who_is_working(message: Message, api: ApiClient) -> None:
         employee_name = row.get("employee_name") or row.get("full_name") or "—"
         location = row.get("location") or row.get("location_name") or "—"
         work_type = row.get("work_type") or row.get("work_type_name") or "—"
+        equipment = row.get("equipment") or row.get("equipment_name") or "—"
         start_raw = str(row.get("start_time") or "")
         start_time = start_raw[:16] if start_raw else "—"
+        geo_lines = build_geo_lines(row)
 
         lines.append(
             f"👤 {employee_name}\n"
             f"📍 Объект: {location}\n"
             f"🔧 Тип: {work_type}\n"
-            f"🕐 Начало: {start_time}"
+            f"🚜 Техника: {equipment}\n"
+            f"🕐 Начало: {start_time}\n"
+            f"{geo_lines}"
         )
 
     await message.answer(
