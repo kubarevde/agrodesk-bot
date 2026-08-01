@@ -226,7 +226,7 @@ class ApiClient:
         except Exception as exc:
             return False, f'{type(exc).__name__}: {exc}'
 
-    async def resolve_access(self, tg_id: int) -> AccessResult:
+    async def resolve_access(self, tg_id: int, *, _retried: bool = False) -> AccessResult:
         """Auth + /employees/me with classified errors for user-facing messages."""
         token, auth_error = await self._get_token_result(tg_id)
         if auth_error is not None:
@@ -239,6 +239,8 @@ class ApiClient:
             return AccessResult(employee=None, error=AccessError.UNREACHABLE)
         if response.status_code == 401:
             self.invalidate_token(tg_id)
+            if not _retried:
+                return await self.resolve_access(tg_id, _retried=True)
             return AccessResult(employee=None, error=AccessError.NOT_LINKED)
         if response.status_code == 403:
             return AccessResult(employee=None, error=AccessError.FORBIDDEN)
@@ -257,6 +259,19 @@ class ApiClient:
             return AccessResult(employee=None, error=AccessError.UNKNOWN)
         if not isinstance(data, dict):
             return AccessResult(employee=None, error=AccessError.UNKNOWN)
+
+        # Stale JWT after TG rebind: profile telegram_id must match caller.
+        linked_tg = data.get('telegram_id')
+        try:
+            linked_int = int(linked_tg) if linked_tg not in (None, '') else None
+        except (TypeError, ValueError):
+            linked_int = None
+        if linked_int != int(tg_id):
+            self.invalidate_token(tg_id)
+            if not _retried:
+                return await self.resolve_access(tg_id, _retried=True)
+            return AccessResult(employee=None, error=AccessError.NOT_LINKED)
+
         return AccessResult(employee=data)
 
     async def _get_token_result(self, tg_id: int) -> tuple[str | None, AccessError | None]:
